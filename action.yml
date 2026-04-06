@@ -8,7 +8,7 @@ branding:
 
 inputs:
   github-token:
-    description: GitHub token used to read PR data and post/update comments.
+    description: GitHub token used to read PR data and optionally manage reminder comments.
     required: true
   exclude-branches:
     description: Comma or newline separated branch name patterns to skip (e.g. dependabot/**).
@@ -18,6 +18,10 @@ inputs:
     description: Comma separated label names that skip issue check when applied to the PR.
     required: false
     default: skip-issue-check,documentation
+  comment:
+    description: Whether to post or update the missing-issue reminder comment when no linked issue is found.
+    required: false
+    default: "false"
   comment-marker:
     description: Marker used to identify this action's reminder comment for safe updates/removal.
     required: false
@@ -85,6 +89,8 @@ runs:
             return;
           }
 
+          const shouldComment = core.getInput("comment").trim().toLowerCase() === "true";
+
           const owner = context.repo.owner;
           const repo = context.repo.repo;
           const defaultCommentMarker = "<!-- pr-check:missing-linked-issue -->";
@@ -93,6 +99,11 @@ runs:
           const excludeBranches = getInputList("exclude-branches");
           const excludeLabels = getInputList("exclude-labels").map((label) => label.toLowerCase());
 
+          const isPermissionError = (error) => {
+            const status = Number(error?.status || error?.response?.status);
+            return status === 403;
+          };
+
           if (rawIssueMarker === "") {
             core.info(`comment-marker was empty; falling back to default marker: ${issueMarker}`);
           }
@@ -100,13 +111,21 @@ runs:
           const deleteExistingReminderComment = async (reason) => {
             const existingComment = await findMarkerComment(owner, repo, pr.number, issueMarker);
             if (existingComment) {
-              await github.rest.issues.deleteComment({
-                owner,
-                repo,
-                comment_id: existingComment.id,
-              });
-              core.info(`${reason}; removed previous reminder comment.`);
-              return;
+              try {
+                await github.rest.issues.deleteComment({
+                  owner,
+                  repo,
+                  comment_id: existingComment.id,
+                });
+                core.info(`${reason}; removed previous reminder comment.`);
+                return;
+              } catch (error) {
+                if (!shouldComment && isPermissionError(error)) {
+                  core.info(`${reason}; unable to remove previous reminder comment due permission limits.`);
+                  return;
+                }
+                throw error;
+              }
             }
 
             core.info(`${reason}; no reminder comment to remove.`);
@@ -158,20 +177,17 @@ runs:
               Boolean,
             );
 
-          const existingComment = await findMarkerComment(owner, repo, pr.number, issueMarker);
           if (linkedIssues.length > 0) {
-            if (existingComment) {
-              await github.rest.issues.deleteComment({
-                owner,
-                repo,
-                comment_id: existingComment.id,
-              });
-              core.info("Linked issue found; removed previous reminder comment.");
-            } else {
-              core.info("Linked issue found; no reminder comment to remove.");
-            }
+            await deleteExistingReminderComment("Linked issue found");
             return;
           }
+
+          if (!shouldComment) {
+            core.setFailed("No linked issue found for this pull request.");
+            return;
+          }
+
+          const existingComment = await findMarkerComment(owner, repo, pr.number, issueMarker);
 
           const defaultMessage = core.getInput("missing-issue-message");
           const issueMessage =
