@@ -1,0 +1,200 @@
+name: PR Issue Check
+description: Require pull requests to have at least one linked issue.
+author: svtter
+
+branding:
+  icon: check-circle
+  color: blue
+
+inputs:
+  github-token:
+    description: GitHub token used to read PR data and post/update comments.
+    required: true
+  exclude-branches:
+    description: Comma or newline separated branch name patterns to skip (e.g. dependabot/**).
+    required: false
+    default: dependabot/**
+  exclude-labels:
+    description: Comma separated label names that skip issue check when applied to the PR.
+    required: false
+    default: skip-issue-check,documentation
+  comment-marker:
+    description: Marker used to identify this action's reminder comment for safe updates/removal.
+    required: false
+    default: <!-- pr-check:missing-linked-issue -->
+  missing-issue-message:
+    description: Custom message content shown when a PR has no linked closing issue.
+    required: false
+    default: >
+      This pull request does not currently link to a closing issue. For better traceability and release planning,
+      please link the corresponding issue in this PR description.
+
+runs:
+  using: composite
+  steps:
+    - name: Validate PR has linked issue
+      uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
+      with:
+        github-token: ${{ inputs.github-token }}
+        script: |
+          const getInputList = (name) => {
+            return core
+              .getInput(name)
+              .split(/[\n,]/)
+              .map((entry) => entry.trim())
+              .filter(Boolean);
+          };
+
+          const wildcardToRegExp = (pattern) => {
+            const raw = pattern.trim();
+            const escaped = raw
+              .replace(/[.+?^${}()|[\]\\]/g, "\\$&")
+              .replace(/\\\*/g, "*")
+              .replace(/\*\*/g, "___DOUBLE_STAR___")
+              .replace(/\*/g, "[^/]*");
+            const regexSource = escaped.replace(/___DOUBLE_STAR___/g, ".*");
+            return new RegExp(`^${regexSource}$`);
+          };
+
+          const getPullRequest = () => {
+            return context.payload.pull_request;
+          };
+
+          const getComments = async (owner, repo, pullNumber) => {
+            return github.paginate(github.rest.issues.listComments, {
+              owner,
+              repo,
+              issue_number: pullNumber,
+            });
+          };
+
+          const findMarkerComment = async (owner, repo, pullNumber, marker) => {
+            const comments = await getComments(owner, repo, pullNumber);
+            return comments.find(
+              (comment) =>
+                comment.user &&
+                comment.user.login === "github-actions[bot]" &&
+                typeof comment.body === "string" &&
+                (comment.body === marker || comment.body.startsWith(`${marker}\n`)),
+            );
+          };
+
+          const pr = getPullRequest();
+          if (!pr) {
+            core.info("Not a pull request event; skipping issue check.");
+            return;
+          }
+
+          const owner = context.repo.owner;
+          const repo = context.repo.repo;
+          const defaultCommentMarker = "<!-- pr-check:missing-linked-issue -->";
+          const rawIssueMarker = core.getInput("comment-marker").trim();
+          const issueMarker = rawIssueMarker || defaultCommentMarker;
+          const excludeBranches = getInputList("exclude-branches");
+          const excludeLabels = getInputList("exclude-labels").map((label) => label.toLowerCase());
+
+          if (rawIssueMarker === "") {
+            core.info(`comment-marker was empty; falling back to default marker: ${issueMarker}`);
+          }
+
+          const deleteExistingReminderComment = async (reason) => {
+            const existingComment = await findMarkerComment(owner, repo, pr.number, issueMarker);
+            if (existingComment) {
+              await github.rest.issues.deleteComment({
+                owner,
+                repo,
+                comment_id: existingComment.id,
+              });
+              core.info(`${reason}; removed previous reminder comment.`);
+              return;
+            }
+
+            core.info(`${reason}; no reminder comment to remove.`);
+          };
+
+          if (pr.draft === true) {
+            await deleteExistingReminderComment("Draft pull request detected; skipping issue check");
+            return;
+          }
+
+          const branch = (pr.head && pr.head.ref) || "";
+          const shouldSkipBranch = excludeBranches.some((pattern) => wildcardToRegExp(pattern).test(branch));
+          if (shouldSkipBranch) {
+            await deleteExistingReminderComment(
+              `Branch ${branch} matches an excluded pattern; skipping issue check`,
+            );
+            return;
+          }
+
+          const labelNames = (pr.labels || []).map((label) => String(label.name || "").toLowerCase());
+          const shouldSkipLabel = excludeLabels.some((label) => labelNames.includes(label));
+          if (shouldSkipLabel) {
+            await deleteExistingReminderComment("Pull request has an excluded label; skipping issue check");
+            return;
+          }
+
+          const query = `query($owner: String!, $repo: String!, $pullRequestNumber: Int!) {
+            repository(owner: $owner, name: $repo) {
+              pullRequest(number: $pullRequestNumber) {
+                closingIssuesReferences(first: 100) {
+                  nodes {
+                    number
+                    title
+                    url
+                  }
+                }
+              }
+            }
+          }`;
+
+          const linkedIssuesResult = await github.graphql(query, {
+            owner,
+            repo,
+            pullRequestNumber: pr.number,
+          });
+
+          const linkedIssues =
+            (linkedIssuesResult?.repository?.pullRequest?.closingIssuesReferences?.nodes || []).filter(
+              Boolean,
+            );
+
+          const existingComment = await findMarkerComment(owner, repo, pr.number, issueMarker);
+          if (linkedIssues.length > 0) {
+            if (existingComment) {
+              await github.rest.issues.deleteComment({
+                owner,
+                repo,
+                comment_id: existingComment.id,
+              });
+              core.info("Linked issue found; removed previous reminder comment.");
+            } else {
+              core.info("Linked issue found; no reminder comment to remove.");
+            }
+            return;
+          }
+
+          const defaultMessage = core.getInput("missing-issue-message");
+          const issueMessage =
+            `${issueMarker}\n\n### Linked issue required\n\n${defaultMessage}\n\n` +
+            `Please include a closing keyword (closes/fixes/resolves) followed by the issue number, for example \"closes #123\", ` +
+            `so this change can be tracked to an open item.`;
+
+          if (existingComment) {
+            await github.rest.issues.updateComment({
+              owner,
+              repo,
+              comment_id: existingComment.id,
+              body: issueMessage,
+            });
+            core.info("Updated existing missing-issue reminder comment.");
+          } else {
+            await github.rest.issues.createComment({
+              owner,
+              repo,
+              issue_number: pr.number,
+              body: issueMessage,
+            });
+            core.info("Created missing-issue reminder comment.");
+          }
+
+          core.setFailed("No linked issue found for this pull request.");
